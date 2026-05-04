@@ -1,4 +1,5 @@
 import sys
+import logging
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -6,6 +7,9 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("etl_job")
 
 args = getResolvedOptions(sys.argv, [
     "JOB_NAME",
@@ -37,13 +41,23 @@ connection_options = {
 
 
 def read_table(table_name):
-    return spark.read.format("jdbc").options(
+    logger.info(f"Extracting table: {db_name}.{table_name}")
+    df = spark.read.format("jdbc").options(
         **connection_options,
         dbtable=f"{db_name}.{table_name}"
     ).load()
+    row_count = df.count()
+    logger.info(f"  -> {table_name}: {row_count} rows extracted")
+    if row_count == 0:
+        logger.warning(f"  -> WARNING: {table_name} is empty!")
+    return df
 
 
-# Extract
+# --- EXTRACTION ---
+
+logger.info("=" * 50)
+logger.info("STEP 1/3 - EXTRACTION")
+logger.info("=" * 50)
 
 customers_df = read_table("customers")
 products_df = read_table("products")
@@ -52,9 +66,15 @@ orderdetails_df = read_table("orderdetails")
 offices_df = read_table("offices")
 employees_df = read_table("employees")
 
-# Transformation
+logger.info("Extraction complete.")
 
-# dim_customers
+# --- TRANSFORMATION ---
+
+logger.info("=" * 50)
+logger.info("STEP 2/3 - TRANSFORMATION (star schema)")
+logger.info("=" * 50)
+
+logger.info("Building dim_customers...")
 dim_customers = customers_df.select(
     F.col("customerNumber").alias("customer_id"),
     F.col("customerName").alias("customer_name"),
@@ -63,7 +83,7 @@ dim_customers = customers_df.select(
     F.col("country")
 )
 
-# dim_products
+logger.info("Building dim_products...")
 dim_products = products_df.select(
     F.col("productCode").alias("product_id"),
     F.col("productName").alias("product_name"),
@@ -71,7 +91,7 @@ dim_products = products_df.select(
     F.col("productVendor").alias("product_vendor")
 )
 
-# dim_dates (derived from distinct order dates)
+logger.info("Building dim_dates...")
 dim_dates = orders_df.select(
     F.col("orderDate")
 ).distinct().select(
@@ -83,7 +103,7 @@ dim_dates = orders_df.select(
     F.dayofmonth("orderDate").alias("day")
 )
 
-# dim_countries (customer countries mapped to territories via sales reps)
+logger.info("Building dim_countries...")
 customer_territory = (
     customers_df
     .join(employees_df, customers_df.salesRepEmployeeNumber == employees_df.employeeNumber, "left")
@@ -104,7 +124,7 @@ dim_countries = all_territories.select(
     F.coalesce(F.col("territory"), F.lit("N/A")).alias("territory")
 ).dropDuplicates(["country"])
 
-# fact_orders
+logger.info("Building fact_orders...")
 fact_orders = (
     orderdetails_df
     .join(orders_df, "orderNumber")
@@ -121,12 +141,30 @@ fact_orders = (
     )
 )
 
-# Load
+logger.info("Transformation complete.")
 
-fact_orders.write.mode("overwrite").parquet(f"{s3_output}/fact_orders")
-dim_customers.write.mode("overwrite").parquet(f"{s3_output}/dim_customers")
-dim_products.write.mode("overwrite").parquet(f"{s3_output}/dim_products")
-dim_dates.write.mode("overwrite").parquet(f"{s3_output}/dim_dates")
-dim_countries.write.mode("overwrite").parquet(f"{s3_output}/dim_countries")
+# --- LOAD ---
+
+logger.info("=" * 50)
+logger.info("STEP 3/3 - LOAD (Parquet to S3)")
+logger.info("=" * 50)
+
+tables = {
+    "fact_orders": fact_orders,
+    "dim_customers": dim_customers,
+    "dim_products": dim_products,
+    "dim_dates": dim_dates,
+    "dim_countries": dim_countries,
+}
+
+for name, df in tables.items():
+    output_path = f"{s3_output}/{name}"
+    logger.info(f"Writing {name} -> {output_path}")
+    df.write.mode("overwrite").parquet(output_path)
+    logger.info(f"  -> {name}: done")
+
+logger.info("=" * 50)
+logger.info("ETL PIPELINE COMPLETED SUCCESSFULLY")
+logger.info("=" * 50)
 
 job.commit()
