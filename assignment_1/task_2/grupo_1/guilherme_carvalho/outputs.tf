@@ -22,3 +22,13 @@ output "glue_role_arn" {
   description = "ARN of the Glue IAM role"
   value = data.aws_iam_role.lab_role.arn
 }
+
+output "glue_database_name" {
+  description = "Glue Catalog database for Athena queries"
+  value = aws_glue_catalog_database.star_schema.name
+}
+
+output "athena_workgroup" {
+  description = "Athena workgroup name"
+  value = aws_athena_workgroup.main.name
+}
