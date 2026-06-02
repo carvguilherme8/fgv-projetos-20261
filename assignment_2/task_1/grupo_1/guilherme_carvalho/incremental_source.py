@@ -71,11 +71,10 @@ def get_watermark(cursor):
     return cursor.fetchone()
 
 
-def init_watermark(args):
+def init_watermark():
     with get_connection() as conn:
         with conn.cursor() as cursor:
             create_watermark_table(cursor)
-
             current_max = get_orders_max_date(cursor)
             if current_max is None:
                 raise SystemExit("orders table is empty or does not exist.")
@@ -109,12 +108,14 @@ def choose_random_existing_items(cursor):
     customer = cursor.fetchone()
     if not customer:
         raise SystemExit("No customers found in the database.")
+
     cursor.execute(
         "SELECT productCode, buyPrice FROM products ORDER BY RAND() LIMIT 1"
     )
     product = cursor.fetchone()
     if not product:
         raise SystemExit("No products found in the database.")
+
     return customer["customerNumber"], product["productCode"], float(product["buyPrice"])
 
 
@@ -125,7 +126,7 @@ def simulate_new_orders(args):
             watermark = get_watermark(cursor)
             if watermark is None:
                 raise SystemExit(
-                    "Watermark record missing. Run the init_watermark command first."
+                    "Watermark record missing. Run the init-watermark command first."
                 )
             base_watermark = watermark["last_processed_order_date"]
             max_order_date = get_orders_max_date(cursor)
@@ -196,7 +197,7 @@ def simulate_new_orders(args):
     print(f"Order detail rows inserted: {created_details}")
 
 
-def validate_incremental_source(args):
+def validate_incremental_source():
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -216,9 +217,7 @@ def validate_incremental_source(args):
                 print("Watermark row exists, but last_processed_order_date is NULL")
                 raise SystemExit(1)
 
-            cursor.execute(
-                "SELECT MAX(orderDate) AS max_date FROM orders"
-            )
+            cursor.execute("SELECT MAX(orderDate) AS max_date FROM orders")
             max_order_date = cursor.fetchone()["max_date"]
             if max_order_date is None:
                 print("orders table is empty or unavailable")
@@ -251,30 +250,49 @@ def validate_incremental_source(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Assignment 2 Task 1 incremental source helper."
+        description="Incremental source utility for the classicmodels sales pipeline."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init_watermark", help="Create watermark metadata baseline")
-    init_parser.set_defaults(func=init_watermark)
-
-    sim_parser = subparsers.add_parser("simulate_new_orders", help="Insert new orders after the current watermark")
-    sim_parser.add_argument("--count", type=int, default=5, help="Number of new orders to create")
-    sim_parser.add_argument("--seed", type=int, default=None, help="Optional seed for reproducible data")
-    sim_parser.set_defaults(func=simulate_new_orders)
-
-    validate_parser = subparsers.add_parser(
-        "validate_incremental_source",
-        help="Validate watermark and pending incremental orders",
+    subparsers.add_parser(
+        "init-watermark",
+        help="Create or initialize the watermark row for the pipeline.",
     )
-    validate_parser.set_defaults(func=validate_incremental_source)
+
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help="Simulate new sales orders for the incremental source.",
+    )
+    simulate_parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of new orders to generate.",
+    )
+    simulate_parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for deterministic order generation.",
+    )
+
+    subparsers.add_parser(
+        "validate",
+        help="Validate the incremental source configuration and watermark state.",
+    )
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    args.func(args)
+
+    if args.command == "init-watermark":
+        init_watermark()
+    elif args.command == "simulate":
+        simulate_new_orders(args)
+    elif args.command == "validate":
+        validate_incremental_source()
 
 
 if __name__ == "__main__":
