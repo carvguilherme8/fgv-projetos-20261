@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import logging
 import os
 import random
 import sys
+import time
 
 import pymysql
 from pymysql.cursors import DictCursor
+from pymysql.err import OperationalError
 
 PIPELINE_NAME = "classicmodels_sales"
 WATERMARK_TABLE = "etl_watermark"
+DEFAULT_COUNT = 5
+DEFAULT_SEED = 1
+CONNECTION_RETRIES = 3
+CONNECTION_DELAY_SECONDS = 5
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection():
@@ -32,18 +41,45 @@ def get_connection():
             )
         )
 
-    return pymysql.connect(
-        host=host,
-        user=user,
-        password=password,
-        database=database,
-        port=port,
-        cursorclass=DictCursor,
-        autocommit=False,
+    last_error = None
+    for attempt in range(1, CONNECTION_RETRIES + 1):
+        try:
+            logger.debug(
+                "Connecting to database %s@%s:%s (attempt %d/%d)",
+                user,
+                host,
+                port,
+                attempt,
+                CONNECTION_RETRIES,
+            )
+            return pymysql.connect(
+                host=host,
+                user=user,
+                password=password,
+                database=database,
+                port=port,
+                cursorclass=DictCursor,
+                autocommit=False,
+            )
+        except OperationalError as exc:
+            last_error = exc
+            logger.warning(
+                "Database connection failed (attempt %d/%d): %s",
+                attempt,
+                CONNECTION_RETRIES,
+                exc,
+            )
+            if attempt == CONNECTION_RETRIES:
+                break
+            time.sleep(CONNECTION_DELAY_SECONDS)
+
+    raise SystemExit(
+        f"Unable to connect to the database after {CONNECTION_RETRIES} attempts: {last_error}"
     )
 
 
 def create_watermark_table(cursor):
+    logger.debug("Ensuring watermark table exists: %s", WATERMARK_TABLE)
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {WATERMARK_TABLE} (
@@ -72,6 +108,7 @@ def get_watermark(cursor):
 
 
 def init_watermark():
+    logger.info("Initializing watermark for pipeline '%s'", PIPELINE_NAME)
     with get_connection() as conn:
         with conn.cursor() as cursor:
             create_watermark_table(cursor)
@@ -88,7 +125,11 @@ def init_watermark():
                     (PIPELINE_NAME, current_max),
                 )
                 conn.commit()
-                print(f"Inserted watermark row for {PIPELINE_NAME} with last_processed_order_date={current_max}.")
+                logger.info(
+                    "Inserted watermark row for %s with last_processed_order_date=%s.",
+                    PIPELINE_NAME,
+                    current_max,
+                )
             elif watermark["last_processed_order_date"] is None:
                 cursor.execute(
                     f"UPDATE {WATERMARK_TABLE} SET last_processed_order_date = %s, last_run_status = 'NEVER_RUN' "
@@ -96,11 +137,17 @@ def init_watermark():
                     (current_max, PIPELINE_NAME),
                 )
                 conn.commit()
-                print(f"Updated watermark row for {PIPELINE_NAME} with last_processed_order_date={current_max}.")
+                logger.info(
+                    "Updated watermark row for %s with last_processed_order_date=%s.",
+                    PIPELINE_NAME,
+                    current_max,
+                )
             else:
-                print(
-                    f"Watermark row already exists for {PIPELINE_NAME} "
-                    f"with last_processed_order_date={watermark['last_processed_order_date']}.")
+                logger.info(
+                    "Watermark row already exists for %s with last_processed_order_date=%s.",
+                    PIPELINE_NAME,
+                    watermark["last_processed_order_date"],
+                )
 
 
 def choose_random_existing_items(cursor):
@@ -120,7 +167,21 @@ def choose_random_existing_items(cursor):
 
 
 def simulate_new_orders(args):
+    if args.count < 0:
+        raise SystemExit("--count must be zero or positive.")
+
     random.seed(args.seed)
+    logger.info(
+        "Simulating %d new order(s) with seed %d (dry-run=%s)",
+        args.count,
+        args.seed,
+        args.dry_run,
+    )
+
+    if args.count == 0:
+        logger.info("No orders requested, skipping simulation.")
+        return
+
     with get_connection() as conn:
         with conn.cursor() as cursor:
             watermark = get_watermark(cursor)
@@ -128,6 +189,7 @@ def simulate_new_orders(args):
                 raise SystemExit(
                     "Watermark record missing. Run the init-watermark command first."
                 )
+
             base_watermark = watermark["last_processed_order_date"]
             max_order_date = get_orders_max_date(cursor)
             if max_order_date is None and base_watermark is None:
@@ -189,7 +251,12 @@ def simulate_new_orders(args):
                 first_date = first_date or order_date
                 last_date = order_date
 
-            conn.commit()
+            if args.dry_run:
+                conn.rollback()
+                logger.info("Dry run complete; inserted rows were rolled back.")
+            else:
+                conn.commit()
+                logger.info("Simulation committed to the database.")
 
     print("Simulation completed")
     print(f"Created orders: {created_orders}")
@@ -198,6 +265,7 @@ def simulate_new_orders(args):
 
 
 def validate_incremental_source():
+    logger.info("Validating incremental source state")
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -206,21 +274,21 @@ def validate_incremental_source():
                 (WATERMARK_TABLE,),
             )
             if cursor.fetchone()["cnt"] == 0:
-                print(f"Missing table: {WATERMARK_TABLE}")
+                logger.error("Missing table: %s", WATERMARK_TABLE)
                 raise SystemExit(1)
 
             watermark = get_watermark(cursor)
             if watermark is None:
-                print(f"Missing watermark row for pipeline {PIPELINE_NAME}")
+                logger.error("Missing watermark row for pipeline %s", PIPELINE_NAME)
                 raise SystemExit(1)
             if watermark["last_processed_order_date"] is None:
-                print("Watermark row exists, but last_processed_order_date is NULL")
+                logger.error("Watermark row exists, but last_processed_order_date is NULL")
                 raise SystemExit(1)
 
             cursor.execute("SELECT MAX(orderDate) AS max_date FROM orders")
             max_order_date = cursor.fetchone()["max_date"]
             if max_order_date is None:
-                print("orders table is empty or unavailable")
+                logger.error("orders table is empty or unavailable")
                 raise SystemExit(1)
 
             pending_query = (
@@ -233,18 +301,19 @@ def validate_incremental_source():
             cursor.execute(pending_query, (watermark["last_processed_order_date"],))
             pending_orders = cursor.fetchall()
 
-            print(f"Watermark last_processed_order_date: {watermark['last_processed_order_date']}")
-            print(f"Max orders.orderDate: {max_order_date}")
-            print(f"Pending orders after watermark: {len(pending_orders)}")
+            logger.info("Watermark last_processed_order_date: %s", watermark["last_processed_order_date"])
+            logger.info("Max orders.orderDate: %s", max_order_date)
+            logger.info("Pending orders after watermark: %d", len(pending_orders))
 
             if pending_orders:
                 bad_orders = [row for row in pending_orders if row["detail_count"] == 0]
                 if bad_orders:
-                    print("Found orders after watermark without orderdetails:")
+                    logger.error("Found orders after watermark without orderdetails:")
                     for bad in bad_orders:
-                        print(f" orderNumber={bad['orderNumber']} orderDate={bad['orderDate']}")
+                        logger.error(" orderNumber=%s orderDate=%s", bad["orderNumber"], bad["orderDate"])
                     raise SystemExit(1)
 
+            logger.info("Incremental source validation passed.")
             print("Incremental source validation passed.")
 
 
@@ -266,14 +335,19 @@ def parse_args():
     simulate_parser.add_argument(
         "--count",
         type=int,
-        default=1,
+        default=DEFAULT_COUNT,
         help="Number of new orders to generate.",
     )
     simulate_parser.add_argument(
         "--seed",
         type=int,
-        default=1,
+        default=DEFAULT_SEED,
         help="Random seed for deterministic order generation.",
+    )
+    simulate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the simulation without committing changes to the database.",
     )
 
     subparsers.add_parser(
@@ -285,14 +359,26 @@ def parse_args():
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     args = parse_args()
 
-    if args.command == "init-watermark":
-        init_watermark()
-    elif args.command == "simulate":
-        simulate_new_orders(args)
-    elif args.command == "validate":
-        validate_incremental_source()
+    try:
+        if args.command == "init-watermark":
+            init_watermark()
+        elif args.command == "simulate":
+            simulate_new_orders(args)
+        elif args.command == "validate":
+            validate_incremental_source()
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Unexpected error")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
