@@ -93,7 +93,6 @@ def read_watermark():
 
 def update_watermark(new_date, status):
     """Update the watermark row in the RDS etl_watermark table via JDBC."""
-    import jaydebeapi
     import pymysql
 
     # Use pymysql directly for the UPDATE since Spark JDBC is read-oriented.
@@ -289,13 +288,13 @@ try:
     fact_orders = (
         orderdetails_df
         .join(orders_df, "orderNumber")
-        .join(customers_df, orders_df.customerNumber == customers_df.customerNumber, "left")
+        .join(customers_df, "customerNumber", "left")
         .select(
             F.col("orderNumber").alias("order_id"),
-            orders_df.customerNumber.alias("customer_id"),
+            F.col("customerNumber").alias("customer_id"),
             F.col("productCode").alias("product_id"),
             F.date_format("orderDate", "yyyyMMdd").cast(IntegerType()).alias("order_date_key"),
-            F.md5(customers_df.country).alias("country_key"),
+            F.md5(F.col("country")).alias("country_key"),
             F.col("quantityOrdered").alias("quantity_ordered"),
             F.col("priceEach").alias("price_each"),
             (F.col("quantityOrdered") * F.col("priceEach")).alias("sales_amount"),
