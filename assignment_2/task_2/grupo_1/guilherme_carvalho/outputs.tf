@@ -33,13 +33,13 @@ output "athena_workgroup" {
   value       = aws_athena_workgroup.main.name
 }
 
-output "glue_trigger_name" {
-  description = "Glue trigger name for the scheduled ETL job"
-  value       = aws_glue_trigger.glue_schedule.name
+output "eventbridge_rule_name" {
+  description = "EventBridge rule name for the scheduled ETL job"
+  value       = aws_cloudwatch_event_rule.etl_schedule.name
 }
 
-output "glue_trigger_arn" {
-  description = "Glue trigger ARN for the scheduled ETL job"
-  value       = aws_glue_trigger.glue_schedule.arn
+output "eventbridge_rule_arn" {
+  description = "EventBridge rule ARN for the scheduled ETL job"
+  value       = aws_cloudwatch_event_rule.etl_schedule.arn
 }
 

@@ -322,6 +322,40 @@ try:
 
     # fact_orders: partitioned write with dynamic overwrite
     fact_output = f"{s3_output}/fact_orders"
+
+    if not is_full_load:
+        logger.info("Merging new fact orders with existing partitions to avoid data loss...")
+        try:
+            affected_partitions = fact_orders.select("order_year", "order_month").distinct().collect()
+            existing_dfs = []
+            for row in affected_partitions:
+                y = row["order_year"]
+                m = row["order_month"]
+                part_path = f"{fact_output}/order_year={y}/order_month={m}"
+                try:
+                    existing_df = spark.read.parquet(part_path)
+                    existing_df = existing_df.withColumn("order_year", F.lit(y).cast(IntegerType())) \
+                                             .withColumn("order_month", F.lit(m).cast(IntegerType()))
+                    existing_dfs.append(existing_df)
+                    logger.info(f"Loaded existing partition data from: {part_path}")
+                except Exception as part_err:
+                    logger.info(f"No existing partition found or error reading from {part_path}: {part_err}")
+
+            if existing_dfs:
+                from functools import reduce
+                existing_all = reduce(lambda a, b: a.unionByName(b), existing_dfs)
+                
+                # Exclude matching keys (order_id, product_id) from the existing data
+                delta_keys = fact_orders.select("order_id", "product_id").distinct()
+                existing_filtered = existing_all.join(delta_keys, ["order_id", "product_id"], "left_anti")
+                
+                # Combine the remaining old records with the new delta
+                fact_orders = existing_filtered.unionByName(fact_orders)
+                logger.info("Successfully merged delta records with existing partition data.")
+        except Exception as merge_err:
+            logger.error(f"Error during incremental merge: {merge_err}", exc_info=True)
+            raise
+
     logger.info(f"Writing fact_orders -> {fact_output} (partitioned by order_year, order_month)")
     fact_orders.write \
         .mode("overwrite") \
