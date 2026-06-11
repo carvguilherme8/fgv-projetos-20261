@@ -2,6 +2,10 @@ import sys
 import logging
 import datetime
 
+class NormalExit(Exception):
+    """Custom exception to signal a clean, successful exit without raising errors in Glue."""
+    pass
+
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -182,8 +186,7 @@ try:
     if orders_df.count() == 0 and not is_full_load:
         logger.info("No new orders found since watermark. Nothing to process.")
         update_watermark(last_processed_date, "SUCCEEDED")
-        job.commit()
-        sys.exit(0)
+        raise NormalExit()
 
     # Extract orderdetails only for relevant orders
     order_numbers = [row["orderNumber"] for row in orders_df.select("orderNumber").collect()]
@@ -354,6 +357,8 @@ try:
     logger.info("INCREMENTAL ETL PIPELINE COMPLETED SUCCESSFULLY")
     logger.info("=" * 60)
 
+except NormalExit:
+    logger.info("NormalExit caught. Exiting cleanly without error.")
 except Exception as e:
     logger.error(f"ETL pipeline failed: {e}", exc_info=True)
     try:
